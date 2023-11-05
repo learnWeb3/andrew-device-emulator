@@ -1,0 +1,52 @@
+{
+	"info": {
+		"_postman_id": "22428fe8-14f6-4b30-a1da-1266e0730287",
+		"name": "andrew-device-emulator",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "13953520"
+	},
+	"item": [
+		{
+			"name": "set engine on",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"url": {
+					"raw": "{{ROOT_URL}}/engine/on",
+					"host": [
+						"{{ROOT_URL}}"
+					],
+					"path": [
+						"engine",
+						"on"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "set engine off",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"url": {
+					"raw": "{{ROOT_URL}}/engine/off",
+					"host": [
+						"{{ROOT_URL}}"
+					],
+					"path": [
+						"engine",
+						"off"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "ROOT_URL",
+			"value": "http://localhost:6000"
+		}
+	]
+}

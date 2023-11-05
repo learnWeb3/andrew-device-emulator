@@ -1,11 +1,26 @@
-const mqtt = require("mqtt");
-const cron = require("node-cron");
-const { KeycloakClient } = require("./lib/KeycloakClient");
+import mqtt from "mqtt";
+import cron from "node-cron";
+import dotenv from "dotenv";
+import { KeycloakClient } from "./lib/KeycloakClient.js";
+import { StorageClient } from "./lib/StorageClient.js";
+import { fetchAndSaveDataFromObd } from "./lib/utils/data-collection.js";
+import {
+  AndrewDeviceActivationStatusRequestEvent,
+  AndrewDeviceActivationStatusResponseEvent,
+  AndrewDeviceDrivingSessionEndEvent,
+  AndrewDeviceDrivingSessionStartEvent,
+  AndrewDeviceEvent,
+  AndrewDeviceMetricEvent,
+} from "andrew-events-schema/andrew-device-events";
+import { Device } from "./lib/Device.js";
+import { sendDataToSystem } from "./lib/utils/data-transmission.js";
+import { Vehicle } from "./lib/Vehicle.js";
+import express from "express";
 
 const isProd = process.env.NODE_ENV === "production";
 
 if (!isProd) {
-  require("dotenv").config({
+  dotenv.config({
     path: ".env.development",
   });
 }
@@ -13,96 +28,287 @@ if (!isProd) {
 const {
   MQTT_AUTH_USERNAME,
   MQTT_BROKER_HOST,
-  MQTT_TOPIC_PREFIX,
+  MQTT_PUBLISH_TOPIC_PREFIX,
+  MQTT_SUBSCRIBE_TOPIC_PREFIX,
   MQTT_BROKER_PROTOCOL,
   KEYCLOAK_ISSUER,
   KEYCLOAK_CLIENT_ID,
   KEYCLOAK_CLIENT_SECRET,
+  VEHICLE_VIN,
+  DEVICE_ID,
 } = process.env;
 
 async function main() {
-  const keycloakClient = new KeycloakClient(KEYCLOAK_ISSUER, {
+
+  const DEVICE_ACTIVE_STATUS = "PAIRED"
+
+  const DEVICE_API_EVENT_TYPES = {
+    ACTIVATION_STATUS_RESPONSE: "andrew.device.activation-status-response",
+  };
+
+  const VEHICLE_ENGINE_STATE_CHECK_CRON_PATTERN = "* * * * * *";
+  const DATA_COLLECTION_CRON_PATTERN = "* * * * * *";
+  const DATA_TRANSMISSION_CRON_PATTERN = "*/30 * * * * *";
+
+  const VEHCILE_OBJ = new Vehicle(VEHICLE_VIN);
+  const DEVICE_OBJ = new Device(VEHICLE_VIN, DEVICE_ID);
+
+  // EXPRESS SERVER TO START ENGINE
+  const app = express();
+
+  app.post("/engine/on", async (req, res) => {
+    VEHCILE_OBJ.engineOn = true;
+    console.log(`===> vehicle engine set to ON`);
+    res.status(200);
+    res.json({
+      engineOn: VEHCILE_OBJ.engineOn,
+    });
+  });
+
+  app.post("/engine/off", async (req, res) => {
+    VEHCILE_OBJ.engineOn = false;
+    console.log(`===> vehicle engine set to OFF`);
+    res.status(200);
+    res.json({
+      engineOn: VEHCILE_OBJ.engineOn,
+    });
+  });
+
+  app.listen(6000, "0.0.0.0", () => {
+    console.log(`server running on port 6000`);
+  });
+
+  cron.schedule(DATA_COLLECTION_CRON_PATTERN, () => {
+    if (
+      DEVICE_OBJ.isActive &&
+      DEVICE_OBJ.drivingSessionHasStarted &&
+      VEHCILE_OBJ.engineOn
+    ) {
+      fetchAndSaveDataFromObd(DEVICE_OBJ.vehicleVIN, DEVICE_OBJ.deviceId);
+    }
+  });
+
+  // open mqtt connection
+  const KEYCLOAK_CLIENT = new KeycloakClient(KEYCLOAK_ISSUER, {
     clientId: KEYCLOAK_CLIENT_ID,
     clientSecret: KEYCLOAK_CLIENT_SECRET,
   });
-  keycloakClient.authenticate().then(({ access_token }) => {
 
-    const client = mqtt.connect(`${MQTT_BROKER_PROTOCOL}://${MQTT_BROKER_HOST}`, {
-      username: MQTT_AUTH_USERNAME,
-      password: access_token,
-      rejectUnauthorized: true,
-      clientId: KEYCLOAK_CLIENT_ID,
-      will: {
-        topic: `${MQTT_TOPIC_PREFIX}/${KEYCLOAK_CLIENT_ID}/status`,
-        payload: JSON.stringify({
-          online: false,
-        }),
-        qos: 2,
-        retain: true,
-      },
-    });
+  KEYCLOAK_CLIENT.authenticate().then(({ access_token }) => {
+    console.log(`===> authenticated with keycloak`);
+    console.log(
+      `===> attempting mqtt broker connection to ${MQTT_BROKER_PROTOCOL}://${MQTT_BROKER_HOST}`
+    );
 
-    client.on("connect", function () {
-      console.log("broker connection opened.");
+    const MQTT_CLIENT = mqtt.connect(
+      `${MQTT_BROKER_PROTOCOL}://${MQTT_BROKER_HOST}`,
+      {
+        username: MQTT_AUTH_USERNAME,
+        password: access_token,
+        rejectUnauthorized: true,
+        clientId: KEYCLOAK_CLIENT_ID,
+      }
+    );
 
-      // send online status on connection of the device
-      const deviceStatusMQTTMessageOptions = {
-        qos: 2,
-        retain: true,
-      };
-      const statusMessage = JSON.stringify({
-        online: true,
-      });
-      client.publish(
-        `${MQTT_TOPIC_PREFIX}/${KEYCLOAK_CLIENT_ID}/status`,
-        statusMessage,
-        deviceStatusMQTTMessageOptions,
+    MQTT_CLIENT.on("connect", function () {
+      console.log("===> mqtt broker connection opened.");
+
+      /** DEVICE ACTIVATION STATUS REQUEST */
+      const deviceActivationRequestEvent = JSON.stringify(
+        new AndrewDeviceActivationStatusRequestEvent(DEVICE_OBJ.deviceId, {
+          device: DEVICE_OBJ.deviceId,
+          vehicle: DEVICE_OBJ.vehicleVIN,
+        })
+      );
+
+      MQTT_CLIENT.publish(
+        `${MQTT_PUBLISH_TOPIC_PREFIX}/activation-request`,
+        deviceActivationRequestEvent,
+        {
+          qos: 2,
+          retain: true,
+        },
         function (err) {
           if (!err) {
             console.log(
-              "connected, sending device status",
-              JSON.stringify(statusMessage, null, 4)
+              "===> attempting device activation request",
+              deviceActivationRequestEvent
             );
           }
         }
       );
 
-      cron.schedule("* * * * * *", () => {
-        const deviceTestMQTTMessageOptions = {
-          qos: 2,
-          retain: true,
-        };
-        const testMessage = JSON.stringify({
-          message: "This a test message",
-          createdAt: Date.now(),
-        });
-        client.publish(
-          `${MQTT_TOPIC_PREFIX}/${KEYCLOAK_CLIENT_ID}/test`,
-          testMessage,
-          deviceTestMQTTMessageOptions,
-          function (err) {
-            if (!err) {
-              console.log(
-                "connected, sending test message",
-                JSON.stringify(testMessage, null, 4)
+      cron.schedule(VEHICLE_ENGINE_STATE_CHECK_CRON_PATTERN, () => {
+        if (
+          DEVICE_OBJ.isActive &&
+          !DEVICE_OBJ.busy &&
+          !DEVICE_OBJ.drivingSessionHasStarted &&
+          VEHCILE_OBJ.engineOn
+        ) {
+          /** MAKE DEVICE BUSY */
+          DEVICE_OBJ.busy = true;
+          /** DRIVING SESSION START  */
+          const drivingSessionStartEvent = JSON.stringify(
+            new AndrewDeviceDrivingSessionStartEvent(DEVICE_OBJ.deviceId, {
+              device: DEVICE_OBJ.deviceId,
+              vehicle: DEVICE_OBJ.vehicleVIN,
+            })
+          );
+
+          MQTT_CLIENT.publish(
+            `${MQTT_PUBLISH_TOPIC_PREFIX}/driving-session-start`,
+            drivingSessionStartEvent,
+            {
+              qos: 2,
+              retain: true,
+            },
+            function (err) {
+              if (!err) {
+                // log
+                console.log(
+                  "===> send driving session start event",
+                  drivingSessionStartEvent
+                );
+                // START DRIVING SESSION
+                DEVICE_OBJ.startDrivingSession();
+              }
+            }
+          );
+
+          /** RELEASE DEVICE BUSY STATE */
+          DEVICE_OBJ.busy = false;
+        }
+
+        if (
+          DEVICE_OBJ.isActive &&
+          !DEVICE_OBJ.busy &&
+          DEVICE_OBJ.drivingSessionHasStarted &&
+          !VEHCILE_OBJ.engineOn
+        ) {
+          /** MAKE DEVICE BUSY */
+          DEVICE_OBJ.busy = true;
+          /** DRIVING SESSION END  */
+          const drivingSessionEndEvent = JSON.stringify(
+            new AndrewDeviceDrivingSessionEndEvent(DEVICE_OBJ.deviceId, {
+              device: DEVICE_OBJ.deviceId,
+              vehicle: DEVICE_OBJ.vehicleVIN,
+            })
+          );
+
+          MQTT_CLIENT.publish(
+            `${MQTT_PUBLISH_TOPIC_PREFIX}/driving-session-end`,
+            drivingSessionEndEvent,
+            {
+              qos: 2,
+              retain: true,
+            },
+            function (err) {
+              if (!err) {
+                // log
+                console.log(
+                  "===> send driving session end event",
+                  drivingSessionEndEvent
+                );
+                // END DRIVING SESSION
+                DEVICE_OBJ.endDrivingSession();
+              }
+            }
+          );
+
+          /** RELEASE DEVICE BUSY STATE */
+          DEVICE_OBJ.busy = false;
+        }
+      });
+
+      /** SUBSCRIBE TO DATA COMMING FROM THE API */
+      MQTT_CLIENT.subscribe(`${MQTT_SUBSCRIBE_TOPIC_PREFIX}/#`, (err) => {
+        if (err) {
+          console.log(err);
+        } else {
+          console.log(`subscribed to topic ${MQTT_SUBSCRIBE_TOPIC_PREFIX}/#`);
+        }
+      });
+
+      /** DEVICE DATA TRANSMISSION LOOP */
+      cron.schedule(DATA_TRANSMISSION_CRON_PATTERN, () => {
+        if (
+          DEVICE_OBJ.isActive &&
+          !DEVICE_OBJ.busy &&
+          DEVICE_OBJ.drivingSessionHasStarted &&
+          VEHCILE_OBJ.engineOn
+        ) {
+          DEVICE_OBJ.busy = true;
+
+          sendDataToSystem((dataPoints = []) => {
+            for (const data of dataPoints) {
+              const deviceMetricEvent = JSON.stringify(
+                new AndrewDeviceMetricEvent(DEVICE_OBJ.deviceId, {
+                  ...data,
+                })
+              );
+
+              MQTT_CLIENT.publish(
+                `${MQTT_PUBLISH_TOPIC_PREFIX}/metric`,
+                deviceMetricEvent,
+                {
+                  qos: 2,
+                  retain: true,
+                },
+                function (err) {
+                  if (!err) {
+                    console.log(
+                      "===> sending device metric",
+                      deviceMetricEvent
+                    );
+                  }
+                }
               );
             }
+            DEVICE_OBJ.busy = false;
+          });
+        } else {
+          if (!VEHCILE_OBJ.engineOn) {
+            console.log(`===> engine is off retrying later on ...`);
           }
-        );
+
+          if (DEVICE_OBJ.isActive && DEVICE_OBJ.busy) {
+            console.log(`===> device is busy retrying later on...`);
+          }
+
+          if (!DEVICE_OBJ.isActive) {
+            console.log(`===> device is desactvated retrying later on ...`);
+          }
+        }
       });
     });
 
-    client.on("message", function (topic, message) {
+    MQTT_CLIENT.on("message", function (topic, message) {
       // message is Buffer
-      message = JSON.parse(message.toString());
-      console.log(message);
+      const parsedMessage = JSON.parse(message.toString());
+
+      switch (parsedMessage.type) {
+        case DEVICE_API_EVENT_TYPES.ACTIVATION_STATUS_RESPONSE:
+          const activationStatusResponseEvent =
+            new AndrewDeviceActivationStatusResponseEvent(
+              parsedMessage.subject,
+              parsedMessage.data
+            );
+          if (DEVICE_ACTIVE_STATUS === activationStatusResponseEvent.data.status) {
+            DEVICE_OBJ.isActive = true;
+          }
+          break;
+        default:
+          console.log(
+            `===> api events not implemented for type ${parsedMessage.type}`
+          );
+          break;
+      }
     });
 
-    client.on("error", function (err) {
+    MQTT_CLIENT.on("error", function (err) {
       console.error(err);
     });
-
-  })
+  });
 }
 
 main();
