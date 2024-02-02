@@ -16,6 +16,8 @@ import { Device } from "./lib/Device.js";
 import { sendDataToSystem } from "./lib/utils/data-transmission.js";
 import { Vehicle } from "./lib/Vehicle.js";
 import express from "express";
+import fs from 'fs'
+import { join } from 'path'
 
 const isProd = process.env.NODE_ENV === "production";
 
@@ -52,6 +54,10 @@ async function main() {
 
   const VEHCILE_OBJ = new Vehicle(VEHICLE_VIN);
   const DEVICE_OBJ = new Device(VEHICLE_VIN, DEVICE_ID);
+
+  // Load your server certificate and key
+  const serverCert = fs.readFileSync(join(process.cwd(), 'certs', 'isrgrootx1.pem'));
+
 
   // EXPRESS SERVER TO START ENGINE
   const app = express();
@@ -107,6 +113,7 @@ async function main() {
         password: access_token,
         rejectUnauthorized: true,
         clientId: KEYCLOAK_CLIENT_ID,
+        ca: serverCert
       }
     );
 
